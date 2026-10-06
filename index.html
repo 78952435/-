@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>3D蓝紫发光粒子球 + 翻页时钟 + 音乐可视化</title>
+<style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #000000;
+    font-family: "SF Mono", "Roboto Mono", "Courier New", monospace;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* ========== 翻页时钟容器：固定在球体下方居中 ========== */
+  #clock {
+    position: fixed;
+    left: 50%;
+    bottom: 12%;
+    transform: translateX(-50%);
+    z-index: 10;
+
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 14px;
+    border-radius: 10px;
+
+    background: rgba(20, 10, 40, 0.35);
+    border: 1px solid rgba(140, 90, 255, 0.25);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+
+    pointer-events: none;
+    user-select: none;
+  }
+
+  #clock .date {
+    font-size: 14px;
+    letter-spacing: 2px;
+    color: #b794ff;
+    text-shadow:
+      0 0 6px rgba(120, 70, 255, 0.6),
+      0 0 14px rgba(80, 40, 200, 0.4);
+  }
+
+  #clock .sep {
+    width: 1px;
+    height: 18px;
+    background: rgba(180, 140, 255, 0.35);
+  }
+
+  #clock .time {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+  }
+
+  #clock .digit {
+    display: inline-block;
+    min-width: 18px;
+    text-align: center;
+    font-size: 22px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: #e8d9ff;
+    text-shadow:
+      0 0 8px rgba(160, 110, 255, 0.85),
+      0 0 18px rgba(110, 60, 220, 0.55),
+      0 0 30px rgba(70, 30, 180, 0.35);
+  }
+
+  #clock .colon {
+    color: #8a5cf0;
+    text-shadow:
+      0 0 8px rgba(140, 90, 255, 0.8),
+      0 0 18px rgba(100, 50, 210, 0.5);
+    animation: blink 1s steps(2, start) infinite;
+  }
+
+  @keyframes blink {
+    50% {
+      opacity: 0.25;
+    }
+  }
+
+  /* ========== 全屏提示遮罩 ========== */
+  #fullscreenOverlay {
+    position: fixed;
+    inset: 0;
+    z-index: 99;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: auto;
+  }
+
+  #fullscreenTip {
+    padding: 18px 32px;
+    font-size: 20px;
+    color: #e8d9ff;
+    border: 1px solid rgba(140, 90, 255, 0.4);
+    background: rgba(40, 20, 80, 0.45);
+    border-radius: 12px;
+    text-shadow: 0 0 10px #8a5cf0;
+    backdrop-filter: blur(4px);
+    user-select: none;
+  }
+
+  /* ========== 隐藏的文件输入：用于唤起系统文件管理器 ========== */
+  #audioFileInput {
+    display: none;
+  }
+</style>
+</head>
+<body>
+
+<!-- 全屏提示遮罩 -->
+<div id="fullscreenOverlay">
+  <div id="fullscreenTip">点击任意位置进入全屏</div>
+</div>
+
+<!-- 翻页时钟 -->
+<div id="clock">
+  <span class="date" id="dateText"></span>
+  <span class="sep"></span>
+  <span class="time">
+    <span class="digit" id="hh1"></span>
+    <span class="digit" id="hh2"></span>
+    <span class="colon">:</span>
+    <span class="digit" id="mm1"></span>
+    <span class="digit" id="mm2"></span>
+    <span class="colon">:</span>
+    <span class="digit" id="ss1"></span>
+    <span class="digit" id="ss2"></span>
+  </span>
+</div>
+
+<!-- 隐藏的音频文件选择器 -->
+<input type="file" id="audioFileInput" accept="audio/*" multiple />
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+
+<script>
+// ===================== 全局变量：Three.js 场景 =====================
+let scene, camera, renderer;
+let particleSphere;
+const PARTICLE_COUNT = 3000;
+
+// ===================== 粒子球拖拽与阻尼参数 =====================
+let isDragging = false;
+let startX = 0;
+let startY = 0;
+let velX = 0;
+let velY = 0;
+const dampingFactor = 0.88;
+const sensitivity = 0.00009;
+const originalAutoSpeed = 0.0003;
+let autoRotateSpeed = originalAutoSpeed;
+
+// ===================== 音乐播放列表与 Web Audio =====================
+let audioCtx = null;
+let analyser = null;
+let audioElement = null;
+let playlist = [];
+let currentTrackIndex = 0;
+const audioFileInput = document.getElementById("audioFileInput");
+
+// 初始化 Web Audio 上下文，必须在用户点击后创建
+function initAudioContext() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 256;
+}
+
+// 加载并播放指定索引的音乐
+function loadTrack(index) {
+  if (playlist.length === 0) return;
+
+  // 循环切歌
+  if (index < 0) index = playlist.length - 1;
+  if (index >= playlist.length) index = 0;
+  currentTrackIndex = index;
+
+  const file = playlist[currentTrackIndex];
+  const url = URL.createObjectURL(file);
+
+  // 停止并清理旧音频
+  if (audioElement) {
+    audioElement.pause();
+    audioElement.src = "";
+  }
+
+  audioElement = new Audio(url);
+  initAudioContext();
+
+  // 连接音频分析器，用于可视化
+  const source = audioCtx.createMediaElementSource(audioElement);
+  source.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  audioElement.play();
+
+  // 播放结束自动切到下一首
+  audioElement.onended = () => {
+    nextTrack();
+  };
+}
+
+function prevTrack() {
+  loadTrack(currentTrackIndex - 1);
+}
+
+function nextTrack() {
+  loadTrack(currentTrackIndex + 1);
+}
+
+// 文件选择完成后加入播放列表
+audioFileInput.addEventListener("change", (e) => {
+  const files = Array.from(e.target.files);
+  if (files.length === 0) return;
+
+  playlist = playlist.concat(files);
+
+  // 如果当前没有播放，自动播放新增的第一首
+  if (!audioElement || audioElement.paused) {
+    loadTrack(playlist.length - files.length);
+  }
+
+  // 清空 input 值，避免同一文件无法再次选择
+  audioFileInput.value = "";
+});
+
+// ===================== 全屏功能 =====================
+const fullscreenOverlay = document.getElementById("fullscreenOverlay");
+let lastTapTime = 0;
+
+async function enterFullscreen() {
+  try {
+    await document.documentElement.requestFullscreen();
+  } catch (e) {
+    console.log("自动全屏失败，请点击屏幕进入全屏", e);
+  }
+}
+
+function exitFullscreen() {
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  }
+}
+
+function hideFullscreenOverlay() {
+  fullscreenOverlay.style.display = "none";
+}
+
+// 点击屏幕进入全屏；双击退出全屏
+async function handlePageClick() {
+  const now = Date.now();
+  const deltaTap = now - lastTapTime;
+  lastTapTime = now;
+
+  // 双击退出全屏
+  if (deltaTap < 300 && document.fullscreenElement) {
+    exitFullscreen();
+    return;
+  }
+
+  // 未全屏时进入全屏
+  if (!document.fullscreenElement) {
+    await enterFullscreen();
+    hideFullscreenOverlay();
+  }
+}
+
+// ESC 键退出全屏
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && document.fullscreenElement) {
+    exitFullscreen();
+  }
+});
+
+document.body.addEventListener("click", handlePageClick);
+document.body.addEventListener("touchstart", handlePageClick, { passive: false });
+
+window.addEventListener("load", async () => {
+  try {
+    await enterFullscreen();
+    if (document.fullscreenElement) {
+      hideFullscreenOverlay();
+    }
+  } catch (err) {
+    console.log("浏览器阻止自动全屏，请点击屏幕", err);
+  }
+});
+
+// ===================== 翻页时钟逻辑 =====================
+const dateText = document.getElementById("dateText");
+const hh1 = document.getElementById("hh1");
+const hh2 = document.getElementById("hh2");
+const mm1 = document.getElementById("mm1");
+const mm2 = document.getElementById("mm2");
+const ss1 = document.getElementById("ss1");
+const ss2 = document.getElementById("ss2");
+
+function updateClock() {
+  const now = new Date();
+
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+
+  const hours = String(now.getHours()).padStart(2, "0");
+  const minutes = String(now.getMinutes()).padStart(2, "0");
+  const seconds = String(now.getSeconds()).padStart(2, "0");
+
+  dateText.textContent = `${year}-${month}-${day}`;
+
+  hh1.textContent = hours[0];
+  hh2.textContent = hours[1];
+  mm1.textContent = minutes[0];
+  mm2.textContent = minutes[1];
+  ss1.textContent = seconds[0];
+  ss2.textContent = seconds[1];
+}
+
+function startClock() {
+  updateClock();
+  setInterval(updateClock, 1000);
+}
+
+// ===================== 初始化 3D 粒子球 =====================
+function init() {
+  scene = new THREE.Scene();
+
+  camera = new THREE.PerspectiveCamera(
+    75,
+    window.innerWidth / window.innerHeight,
+    0.1,
+    1000
+  );
+  camera.position.z = 3.0;
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  document.body.appendChild(renderer.domElement);
+
+  const geometry = new THREE.BufferGeometry();
+  const positions = new Float32Array(PARTICLE_COUNT * 3);
+  const originalPositions = new Float32Array(PARTICLE_COUNT * 3);
+  const colors = new Float32Array(PARTICLE_COUNT * 3);
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const index = i * 3;
+    const radius = 1.5;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+
+    const x = radius * Math.sin(phi) * Math.cos(theta);
+    const y = radius * Math.sin(phi) * Math.sin(theta);
+    const z = radius * Math.cos(phi);
+
+    positions[index] = x;
+    positions[index + 1] = y;
+    positions[index + 2] = z;
+
+    originalPositions[index] = x;
+    originalPositions[index + 1] = y;
+    originalPositions[index + 2] = z;
+
+    const mix = Math.random();
+    colors[index] = 0.2 + mix * 0.4;
+    colors[index + 1] = 0;
+    colors[index + 2] = 0.6 + mix * 0.4;
+  }
+
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+
+  const particleMat = new THREE.PointsMaterial({
+    size: 0.05,
+    vertexColors: true,
+    transparent: true,
+    opacity: 0.85,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false
+  });
+
+  particleSphere = new THREE.Points(geometry, particleMat);
+  scene.add(particleSphere);
+
+  particleSphere.userData.originalPositions = originalPositions;
+
+  // 鼠标事件
+  window.addEventListener("mousedown", mouseDown);
+  window.addEventListener("mousemove", mouseMove);
+  window.addEventListener("mouseup", mouseUp);
+  window.addEventListener("mouseleave", mouseUp);
+
+  // 触摸事件
+  window.addEventListener("touchstart", touchStart, { passive: false });
+  window.addEventListener("touchmove", touchMove, { passive: false });
+  window.addEventListener("touchend", touchEnd);
+  window.addEventListener("touchcancel", touchEnd);
+
+  // 键盘事件：上一首/下一首
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "ArrowLeft") prevTrack();
+    if (e.key === "ArrowRight") nextTrack();
+    if (e.key === " ") {
+      e.preventDefault();
+      audioFileInput.click();
+    }
+  });
+
+  window.addEventListener("resize", onResize);
+
+  animate();
+}
+
+// ===================== 鼠标拖拽控制 =====================
+function mouseDown(e) {
+  isDragging = true;
+  autoRotateSpeed = 0;
+  startX = e.clientX;
+  startY = e.clientY;
+}
+
+function mouseMove(e) {
+  if (!isDragging) return;
+
+  const dx = e.clientX - startX;
+  const dy = e.clientY - startY;
+
+  velY += dx * sensitivity;
+  velX += dy * sensitivity;
+
+  startX = e.clientX;
+  startY = e.clientY;
+}
+
+function mouseUp() {
+  isDragging = false;
+  autoRotateSpeed = originalAutoSpeed;
+}
+
+// ===================== 触摸拖拽控制 =====================
+function touchStart(e) {
+  e.preventDefault();
+  isDragging = true;
+  autoRotateSpeed = 0;
+  startX = e.touches[0].clientX;
+  startY = e.touches[0].clientY;
+}
+
+function touchMove(e) {
+  if (!isDragging) return;
+  e.preventDefault();
+
+  const touch = e.touches[0];
+  const dx = touch.clientX - startX;
+  const dy = touch.clientY - startY;
+
+  velY += dx * sensitivity;
+  velX += dy * sensitivity;
+
+  startX = touch.clientX;
+  startY = touch.clientY;
+}
+
+function touchEnd() {
+  isDragging = false;
+  autoRotateSpeed = originalAutoSpeed;
+}
+
+// ===================== 窗口自适应 =====================
+function onResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+// ===================== 动画循环 =====================
+function animate() {
+  requestAnimationFrame(animate);
+
+  // 空闲时自动旋转
+  if (!isDragging) {
+    velY += autoRotateSpeed;
+  }
+
+  particleSphere.rotation.x += velX;
+  particleSphere.rotation.y += velY;
+
+  // 阻尼减速
+  if (!isDragging) {
+    velX *= dampingFactor;
+    velY *= dampingFactor;
+  }
+
+  // 音频驱动粒子球跳动
+  if (analyser) {
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    analyser.getByteFrequencyData(dataArray);
+
+    let sum = 0;
+    for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+    const avgVol = sum / bufferLength;
+
+    // 音量越大，球体膨胀越明显
+    const scale = 1 + avgVol / 1200;
+
+    const posAttr = particleSphere.geometry.attributes.position;
+    const origPos = particleSphere.userData.originalPositions;
+
+    for (let i = 0; i < posAttr.count; i++) {
+      const idx = i * 3;
+      posAttr.array[idx] = origPos[idx] * scale;
+      posAttr.array[idx + 1] = origPos[idx + 1] * scale;
+      posAttr.array[idx + 2] = origPos[idx + 2] * scale;
+    }
+
+    posAttr.needsUpdate = true;
+  }
+
+  renderer.render(scene, camera);
+}
+
+// ===================== 启动程序 =====================
+startClock();
+init();
+</script>
+
+</body>
+</html>
